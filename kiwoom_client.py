@@ -159,13 +159,13 @@ class KiwoomClient:
             "market": "KR",
             "stock_code": stock_code,
             "name": data.get("stk_nm", "N/A"),
-            "current_price": _to_int(data.get("cur_prc")),
+            "current_price": abs(_to_int(data.get("cur_prc"))),
             "currency": "KRW",
             "change": _to_int(data.get("pred_pre")),       # 전일대비
             "change_rate": _to_float(data.get("flu_rt")),  # 등락율(%)
-            "open": _to_int(data.get("open_pric")),
-            "high": _to_int(data.get("high_pric")),
-            "low": _to_int(data.get("low_pric")),
+            "open": abs(_to_int(data.get("open_pric"))),
+            "high": abs(_to_int(data.get("high_pric"))),
+            "low": abs(_to_int(data.get("low_pric"))),
             "volume": _to_int(data.get("trde_qty")),
             "market_cap": _to_int(data.get("mac")),        # 시가총액
             "per": data.get("per", "N/A"),
