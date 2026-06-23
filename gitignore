@@ -1,0 +1,17 @@
+# 환경변수 (키 노출 방지 — 절대 커밋 금지)
+.env
+
+# 로컬 테스트/디버깅용 파일
+check_holdings.py
+
+# 파이썬 캐시
+__pycache__/
+*.pyc
+*.pyo
+
+# 가상환경
+venv/
+.venv/
+
+# macOS
+.DS_Store
