@@ -1,6 +1,6 @@
 """
 키움증권 REST API 클라이언트 (완성본)
-- 토큰 자동 발급 및 캐싱
+- 토큰 자동 발급 및 캐싱 (만료 타임존 보정 + 8005 자동 재발급)
 - 국내 주식/ETF 시세 조회 (ka10001)
 - 계좌평가잔고내역 조회 = 보유종목·평가금액·수익률 (kt00018)
 
@@ -12,18 +12,26 @@
   - 요청 방식: KIS는 GET+params, 키움은 POST+JSON body
   - TR 지정: KIS는 헤더 tr_id, 키움은 헤더 api-id
   - 인증 헤더: 키움은 appsecret 헤더 불필요 (Bearer 토큰만)
-  - 토큰 응답: KIS access_token/expires_in(초), 키움 token/expires_dt(일시)
+  - 토큰 응답: KIS access_token/expires_in(초), 키움 token/expires_dt(일시, KST)
   - 성공 판정: KIS rt_cd=="0", 키움 return_code==0
+
+[토큰 만료 처리 — 중요]
+  키움 expires_dt는 KST 'YYYYMMDDHHMMSS'. naive datetime으로 .timestamp()를 부르면
+  서버 로컬타임(UTC)으로 해석돼 만료시각이 9시간 뒤로 밀려, 죽은 토큰을 계속 재사용하다
+  8005가 발생함 → tzinfo=KST 명시로 보정. 추가로 8005 응답 시 강제 재발급 후 1회 재시도.
 """
 
 import os
 import time
 import requests
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from typing import Optional
 from dotenv import load_dotenv
 
 load_dotenv()
+
+# 키움 expires_dt는 KST 기준
+KST = timezone(timedelta(hours=9))
 
 
 def _to_int(value) -> int:
@@ -72,9 +80,14 @@ class KiwoomClient:
     # ------------------------------------------------------------------ #
     # 토큰
     # ------------------------------------------------------------------ #
-    def _get_access_token(self) -> str:
-        """Access Token 발급 (캐싱, 만료 10분 전 자동 재발급)"""
-        if self._access_token and time.time() < self._token_expires_at - 600:
+    def _get_access_token(self, force: bool = False) -> str:
+        """Access Token 발급 (캐싱, 만료 10분 전 자동 재발급).
+        force=True면 캐시를 무시하고 무조건 새로 발급."""
+        if (
+            not force
+            and self._access_token
+            and time.time() < self._token_expires_at - 600
+        ):
             return self._access_token
 
         url = f"{self.base_url}/oauth2/token"
@@ -96,14 +109,27 @@ class KiwoomClient:
 
         self._access_token = data.get("token") or data.get("access_token")
 
-        # expires_dt('YYYYMMDDHHMMSS') 파싱 시도, 실패 시 보수적으로 12시간 캐싱
+        # 키움 expires_dt는 'YYYYMMDDHHMMSS' (KST). naive로 파싱하면 서버 로컬(UTC)로
+        # 해석돼 만료시각이 9시간 미뤄지는 버그 → tzinfo=KST를 명시해 정확히 환산.
         expires_dt = data.get("expires_dt")
         try:
-            self._token_expires_at = datetime.strptime(
-                expires_dt, "%Y%m%d%H%M%S"
-            ).timestamp()
+            self._token_expires_at = (
+                datetime.strptime(expires_dt, "%Y%m%d%H%M%S")
+                .replace(tzinfo=KST)
+                .timestamp()
+            )
         except (TypeError, ValueError):
+            # expires_dt 누락/형식 변경 시 보수적으로 12시간만 캐싱
             self._token_expires_at = time.time() + 12 * 3600
+
+        # Railway 로그에서 재발급 여부를 추적할 수 있게 기록
+        try:
+            _exp = datetime.fromtimestamp(self._token_expires_at, KST).strftime(
+                "%Y-%m-%d %H:%M:%S KST"
+            )
+        except (OSError, OverflowError, ValueError):
+            _exp = str(self._token_expires_at)
+        print(f"[kiwoom] access token issued (expires_at={_exp})", flush=True)
 
         return self._access_token
 
@@ -117,8 +143,10 @@ class KiwoomClient:
         body: Optional[dict] = None,
         cont_yn: str = "N",
         next_key: str = "",
+        _retry_on_auth: bool = True,
     ) -> dict:
-        """키움 REST API 공통 POST 요청."""
+        """키움 REST API 공통 POST 요청.
+        토큰 무효(8005) 응답 시 토큰을 강제 재발급하고 1회 자동 재시도한다."""
         token = self._get_access_token()
         url = f"{self.base_url}{endpoint}"
         headers = {
@@ -134,6 +162,22 @@ class KiwoomClient:
         data = response.json()
 
         if str(data.get("return_code", "0")) not in ("0", ""):
+            return_msg = str(data.get("return_msg", ""))
+            # 토큰 무효(8005): 캐시 폐기 후 강제 재발급하여 1회만 재시도
+            if _retry_on_auth and "8005" in return_msg:
+                print(
+                    "[kiwoom] token invalid (8005) → force refresh & retry",
+                    flush=True,
+                )
+                self._get_access_token(force=True)
+                return self._request(
+                    api_id,
+                    endpoint,
+                    body,
+                    cont_yn,
+                    next_key,
+                    _retry_on_auth=False,
+                )
             raise RuntimeError(
                 f"키움 API 오류 [{api_id}/{data.get('return_code')}]: {data.get('return_msg')}"
             )
